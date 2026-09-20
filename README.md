@@ -4,6 +4,7 @@ A userscript that adds **batch downloading** to the [PikPak](https://mypikpak.co
 
 [![Greasy Fork](https://img.shields.io/greasyfork/v/596604?label=Greasy%20Fork&logo=greasyfork&color=670000)](https://greasyfork.org/scripts/596604-pikpak-multi-download)
 [![Installs](https://img.shields.io/greasyfork/dt/596604?label=installs)](https://greasyfork.org/scripts/596604-pikpak-multi-download)
+[![OpenUserJS](https://img.shields.io/badge/OpenUserJS-install-2e7d32)](https://openuserjs.org/scripts/DungGramer/PikPak_Multi-Download)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## Features
@@ -20,7 +21,10 @@ A userscript that adds **batch downloading** to the [PikPak](https://mypikpak.co
 ## Install
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) (recommended) or [Violentmonkey](https://violentmonkey.github.io/).
-2. Install the script from **[Greasy Fork](https://greasyfork.org/scripts/596604-pikpak-multi-download)** (auto-updates), or from the [raw file](https://raw.githubusercontent.com/DungGramer/pikpak-multi-download/main/pikpak-multi-download.user.js).
+2. Install the script from any of these (same code):
+   - **[Greasy Fork](https://greasyfork.org/scripts/596604-pikpak-multi-download)** - auto-synced from this repo
+   - **[OpenUserJS](https://openuserjs.org/scripts/DungGramer/PikPak_Multi-Download)**
+   - the [raw `.user.js`](https://raw.githubusercontent.com/DungGramer/pikpak-multi-download/main/pikpak-multi-download.user.js) in this repo
 
 ## Usage
 
