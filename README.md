@@ -2,8 +2,8 @@
 
 A userscript that adds **batch downloading** to the [PikPak](https://mypikpak.com) web app - pick multiple files and get them in **one streamed ZIP**, with IDM-style parallel chunks for speed. Works on your own Drive folders **and on public Share links without importing them first**, bypassing the "Open the PikPak desktop app to download multiple files" prompt.
 
-<!-- Install badge/link filled in after GreasyFork publish -->
-[![Install on Greasy Fork](https://img.shields.io/badge/Install-Greasy%20Fork-670000?logo=greasyfork&logoColor=white)](https://greasyfork.org/scripts/GREASYFORK_ID)
+[![Greasy Fork](https://img.shields.io/greasyfork/v/596604?label=Greasy%20Fork&logo=greasyfork&color=670000)](https://greasyfork.org/scripts/596604-pikpak-multi-download)
+[![Installs](https://img.shields.io/greasyfork/dt/596604?label=installs)](https://greasyfork.org/scripts/596604-pikpak-multi-download)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## Features
@@ -20,7 +20,7 @@ A userscript that adds **batch downloading** to the [PikPak](https://mypikpak.co
 ## Install
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) (recommended) or [Violentmonkey](https://violentmonkey.github.io/).
-2. Install the script from **[Greasy Fork](https://greasyfork.org/scripts/GREASYFORK_ID)** (auto-updates), or from the [raw file](https://raw.githubusercontent.com/DungGramer/pikpak-multi-download/main/pikpak-multi-download.user.js).
+2. Install the script from **[Greasy Fork](https://greasyfork.org/scripts/596604-pikpak-multi-download)** (auto-updates), or from the [raw file](https://raw.githubusercontent.com/DungGramer/pikpak-multi-download/main/pikpak-multi-download.user.js).
 
 ## Usage
 
