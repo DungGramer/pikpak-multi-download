@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PikPak Multi-Download
 // @namespace    dunggramer.pikpak
-// @version      2.7.2
+// @version      2.9.0
 // @description  Download many PikPak files at once (Drive folders + Share links, no import needed): thumbnails, per-file progress, one streamed ZIP written straight to disk, IDM-style parallel chunks (~3.5x), close/reload guard, spinning favicon + notification, per-file retry. Share mode harvests links as you preview, then batch-downloads. Bypasses the "Open the PikPak desktop app" prompt.
 // @author       DungGramer
 // @license      MIT
@@ -33,6 +33,10 @@
   const LINK_CONCURRENCY = 4;  // resolve links in parallel (within the ~5 min token window)
   const CHUNK_SIZE = 8 * 1024 * 1024;  // 8MB per range - IDM-style chunking
   const CHUNK_CONCURRENCY = 5; // parallel ranges per file (measured: 1 conn ~1.9MB/s, 4-5 conn ~6.6MB/s = 3.5x; >6 tends to drop)
+  const SMALL_FILE = 2 * CHUNK_SIZE; // below this a file is one request; several are fetched in parallel ahead of the zip writer
+  const FILE_PREFETCH = 4;           // files fetched ahead (RAM <= ~(FILE_PREFETCH+1) x SMALL_FILE). Measured on 12 small files: 4 parallel ~0.8s vs 2.1-3.2s sequential
+  const PROBE_MAX = 24;        // max 1-byte probes per big file before adding it to the zip (finds unreadable regions)
+  const PROBE_MIN_GAP = 2 * 1024 * 1024; // probes are at least this far apart (small files are probed densely)
   const CHUNK_RETRIES = 3;     // retry a range on transient errors (many connections drop occasionally)
 
   // ── auth ─────────────────────────────────────────────────────────────────
@@ -192,6 +196,32 @@
     await writeChain; await writable.close();
   }
 
+  // A zip entry cannot be rolled back once bytes are pushed, so a file whose storage is damaged would
+  // leave a truncated entry. Probe it first: 1-byte ranges evenly spaced (gap = max(PROBE_MIN_GAP,
+  // size/PROBE_MAX)) plus the last byte, CHUNK_CONCURRENCY at a time, stop at the first failure.
+  // Measured on a damaged share file: bytes ~180-256MB of 272MB unreadable (network error), the rest
+  // fine. A hole smaller than the gap can be missed (the entry is then truncated, the row marked error).
+  async function probeFile(url, size) {
+    const gap = Math.max(PROBE_MIN_GAP, Math.ceil(size / PROBE_MAX));
+    const offs = []; for (let o = 0; o < size; o += gap) offs.push(o);
+    offs.push(size - 1);
+    let k = 0, bad = false;
+    await Promise.all(Array.from({ length: Math.min(CHUNK_CONCURRENCY, offs.length) }, async () => {
+      while (!bad && k < offs.length) { const o = offs[k++]; try { await fetchRange(url, o, o); } catch (e) { bad = true; } }
+    }));
+    return !bad;
+  }
+
+  // Where the lower-quality copy goes. The transcodes PikPak serves are often MPEG-TS (first byte 0x47,
+  // again at 188) and HEVC, not an MP4: measured on a share file whose "480P" media began with 'G@' and
+  // 'FFmpeg'. Saved as .mp4 they will not play, so a TS copy gets the .ts extension (VLC/mpv/ffmpeg play it).
+  async function altTarget(name, alt) {
+    let ts = false;
+    try { const r = await fetchRange(alt.url, 0, 376); const b = r.chunk || r.full; ts = !!b && b.length > 188 && b[0] === 0x47 && b[188] === 0x47; } catch (e) { /* keep the original extension */ }
+    const dot = name.lastIndexOf('.'), base = dot > 0 ? name.slice(0, dot) : name, ext = ts ? '.ts' : (dot > 0 ? name.slice(dot) : '');
+    return { name: `${base} (${alt.label})${ext}`, link: alt.url, size: 0, alt: alt.label, ts };
+  }
+
   // ── bundle files into one streamed ZIP on disk ───────────────────────────────
   // items already have .link + .size; onProgress(doneFiles,totalFiles,bytes); setRowProgress(idx,recv,total)
   async function streamZip(items, writable, onProgress, setRowStatus, setRowProgress) {
@@ -203,21 +233,44 @@
       if (chunk && chunk.length) { const c = chunk; writeChain = writeChain.then(() => writable.write(c)); }
     });
     const names = uniquify(items.map(it => it.name));
-    let bytes = 0, doneFiles = 0; const failed = [];
+    let bytes = 0, doneFiles = 0; const failed = [], fallback = [];
+    // Small files are prefetched whole, FILE_PREFETCH ahead, while the writer handles the current one
+    // (even a big chunked one): latency, not bandwidth, dominates small files.
+    const pre = new Map();
+    const startPre = (j) => {
+      const f = items[j];
+      if (j >= items.length || pre.has(j) || !(f.size > 0 && f.size < SMALL_FILE)) return;
+      pre.set(j, fetchRange(f.link, 0, f.size - 1).then(r => ({ b: r.chunk || r.full }), e => ({ e })));
+    };
     for (let i = 0; i < items.length; i++) {
       if (zipErr) throw zipErr;
+      for (let j = i; j <= i + FILE_PREFETCH; j++) startPre(j);
       const it = items[i];
-      const pt = new fflate.ZipPassThrough(names[i]);
+      // Target = what actually gets downloaded for this row: the file itself, or (when its storage is
+      // damaged and the share offered a transcoded media) that lower-quality copy under a marked name.
+      let tgt = { name: names[i], link: it.link, size: it.size };
+      if (!pre.has(i) && it.size >= SMALL_FILE && !(await probeFile(it.link, it.size))) {
+        if (it.alt && it.alt.url) {
+          tgt = await altTarget(names[i], it.alt);
+        } else { // damaged and no copy: skip it (no truncated entry in the zip)
+          it.dlFailed = true; failed.push(it); setRowStatus(it.idx, 'error'); recordMark(it, false); onProgress(doneFiles, items.length, bytes); continue;
+        }
+      }
+      const pt = new fflate.ZipPassThrough(tgt.name);
       zip.add(pt);
       let recv = 0;
       setRowStatus(it.idx, '0%');
-      const onBytes = (nb) => { bytes += nb; recv += nb; onProgress(doneFiles, items.length, bytes); setRowProgress(it.idx, recv, it.size); if (it.size) { const st = document.querySelector(`[data-st="${it.idx}"]`); if (st && st.textContent !== '✓') st.textContent = Math.min(100, Math.round(recv / it.size * 100)) + '%'; } };
+      const onBytes = (nb) => { bytes += nb; recv += nb; onProgress(doneFiles, items.length, bytes); setRowProgress(it.idx, recv, tgt.size); if (tgt.size) { const st = document.querySelector(`[data-st="${it.idx}"]`); if (st && st.textContent !== '✓') st.textContent = Math.min(100, Math.round(recv / tgt.size * 100)) + '%'; } };
       const pushChunk = (b) => pt.push(b, false);
       try {
-        if (it.size >= 2 * CHUNK_SIZE) {
-          await pumpChunked(it.link, it.size, pushChunk, onBytes, () => writeChain);
+        if (pre.has(i)) {
+          const r = await pre.get(i); pre.delete(i);
+          if (r.e) throw r.e;
+          pt.push(r.b, false); await writeChain; onBytes(r.b.length);
+        } else if (tgt.size >= 2 * CHUNK_SIZE) {
+          await pumpChunked(tgt.link, tgt.size, pushChunk, onBytes, () => writeChain);
         } else {
-          const resp = await fetch(it.link);
+          const resp = await fetch(tgt.link);
           if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
           const reader = resp.body.getReader();
           while (true) {
@@ -229,10 +282,11 @@
           }
         }
         pt.push(new Uint8Array(0), true);
-        it.dlFailed = false; doneFiles++; setRowStatus(it.idx, '✓');
+        it.dlFailed = false; doneFiles++; setRowStatus(it.idx, '✓'); recordMark(it, true);
+        if (tgt.alt) { fallback.push(it); const st = document.querySelector(`[data-st="${it.idx}"]`); if (st) st.textContent = '✓ ' + tgt.alt; }
       } catch (e) {
-        pt.push(new Uint8Array(0), true); // close the entry so the zip stays valid
-        it.dlFailed = true; failed.push(it); setRowStatus(it.idx, 'error');
+        pt.push(new Uint8Array(0), true); // close the entry so the zip stays valid (it is truncated: the row is marked error)
+        it.dlFailed = true; failed.push(it); setRowStatus(it.idx, 'error'); recordMark(it, false);
       }
       onProgress(doneFiles, items.length, bytes);
     }
@@ -240,7 +294,7 @@
     await writeChain;
     await writable.close();
     if (zipErr) throw zipErr;
-    return { doneFiles, failFiles: failed.length, failed };
+    return { doneFiles, failFiles: failed.length, failed, fallback };
   }
 
   // fallback when File System Access API is missing: download each file separately (like v1)
@@ -284,6 +338,8 @@
   const CSS = `
   #pmd-btn{position:fixed;right:20px;bottom:20px;z-index:99999;background:#2f6fed;color:#fff;border:none;border-radius:24px;padding:12px 18px;font-size:14px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25)}
   #pmd-btn:hover{background:#255ed0}
+  #pmd-auto{position:fixed;right:20px;bottom:76px;z-index:99999;background:#e8590c;color:#fff;border:none;border-radius:24px;padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.3)}
+  #pmd-auto:hover{background:#c94a08}
   #pmd-overlay{position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center}
   #pmd-panel{background:#fff;color:#222;width:min(960px,96vw);max-height:86vh;border-radius:12px;display:flex;flex-direction:column;overflow:hidden;font-family:system-ui,Arial,sans-serif}
   #pmd-view{margin-left:auto;border:1px solid #ccc;background:none;border-radius:6px;padding:3px 9px;font-size:13px;cursor:pointer;color:inherit}
@@ -301,12 +357,19 @@
   #pmd-tools{padding:8px 18px;border-bottom:1px solid #f0f0f0;display:flex;align-items:center;gap:14px;font-size:13px}
   #pmd-tools label{cursor:pointer;user-select:none}
   #pmd-list{overflow:auto;padding:4px 0;flex:1}
-  .pmd-row{position:relative;display:flex;align-items:center;gap:12px;padding:6px 18px;font-size:13px;border-bottom:1px solid #f7f7f7}
+  .pmd-row{position:relative;display:flex;align-items:center;gap:14px;padding:12px 18px;font-size:14px;border-bottom:1px solid #f7f7f7;cursor:pointer}
   .pmd-row:hover{background:#f6f9ff}
-  .pmd-thumb{width:46px;height:46px;object-fit:cover;border-radius:5px;background:#e9e9e9;flex-shrink:0}
+  .pmd-thumb{width:60px;height:60px;object-fit:cover;border-radius:5px;background:#e9e9e9;flex-shrink:0}
   .pmd-row .pmd-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .pmd-row .pmd-sz{color:#999;min-width:74px;text-align:right}
   .pmd-row .pmd-st{min-width:48px;text-align:right;font-size:12px}
+  .pmd-marks{position:absolute;right:6px;bottom:6px;display:flex;gap:4px;z-index:5;pointer-events:none}
+  .pmd-mark{width:22px;height:22px;border-radius:50%;color:#fff;font:700 13px/22px system-ui,Arial,sans-serif;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.45)}
+  .pmd-mark-ok{background:#2ca02c}.pmd-mark-err{background:#d62728}
+  .pmd-nolink{opacity:.55}.pmd-nolink .pmd-st{color:#999}
+  .pmd-play{flex-shrink:0;width:32px;height:32px;border:none;border-radius:50%;background:#2f6fed;color:#fff;font-size:12px;line-height:32px;padding:0 0 0 2px;cursor:pointer}
+  .pmd-play:hover{background:#255ed0}.pmd-play:disabled{opacity:.4;cursor:not-allowed}
+  #pmd-list.pmd-grid .pmd-play{position:absolute;top:56px;right:6px;width:28px;height:28px;line-height:28px;z-index:2}
   .pmd-prog{position:absolute;left:0;bottom:0;height:3px;width:0;background:#2f6fed;transition:width .15s ease;border-radius:0 2px 2px 0}
   .pmd-prog.done{background:#2ca02c}.pmd-prog.err{background:#d62728}
   .pmd-retry{flex-shrink:0;border:1px solid #d62728;background:none;color:#d62728;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
@@ -383,7 +446,7 @@
     });
     const boxes = () => [...listEl.querySelectorAll('input[type=checkbox]')];
     const selected = () => boxes().filter(b => b.checked).map(b => +b.dataset.i);
-    const refresh = () => { if (busy) return; const n = selected().length; countEl.textContent = n ? n + ' selected' : ''; goBtn.disabled = !n; goBtn.textContent = n ? `Download ZIP (${n})` : 'Download ZIP'; };
+    const refresh = () => { if (busy) return; const n = selected().length; countEl.textContent = n ? n + ' selected' : ''; goBtn.disabled = !n; goBtn.textContent = n === 1 ? 'Download file' : n ? `Download ZIP (${n})` : 'Download ZIP'; };
     const setRowStatus = (i, txt) => {
       const st = listEl.querySelector(`[data-st="${i}"]`);
       if (st) { st.textContent = txt; const isErr = txt === 'error' || txt === 'captcha'; st.style.color = txt === '✓' ? '#2ca02c' : (isErr ? '#d62728' : '#888'); }
@@ -396,7 +459,11 @@
     const updateErrBtn = () => { const n = allItems.filter(it => it.linkFailed || it.dlFailed).length; errBtn.style.display = n ? '' : 'none'; errBtn.textContent = `↻ Retry failed (${n})`; };
     const resetItem = (it) => { it.linkFailed = false; it.dlFailed = false; const pr = listEl.querySelector(`[data-prog="${it.idx}"]`); if (pr) { pr.classList.remove('done', 'err'); pr.style.width = '0'; } setRowStatus(it.idx, ''); };
     listEl.addEventListener('change', refresh);
-    listEl.addEventListener('click', (e) => { const b = e.target.closest('.pmd-retry'); if (b && !busy) retryOne(allItems[+b.dataset.retry]); });
+    listEl.addEventListener('click', (e) => {
+      const b = e.target.closest('.pmd-retry'); if (b && !busy) { retryOne(allItems[+b.dataset.retry]); return; }
+      if (busy || e.target.closest('input,button')) return;
+      const cb = e.target.closest('.pmd-row')?.querySelector('input[type=checkbox]'); if (cb) { cb.checked = !cb.checked; refresh(); } // click anywhere on the row toggles it
+    });
     allBox.onchange = () => { boxes().forEach(b => b.checked = allBox.checked); refresh(); };
     refresh();
 
@@ -460,7 +527,8 @@
     }
 
     // Retry one file: download it RAW (no zip) with its real name. The ↻ button on a failed row.
-    async function retryOne(it) {
+    async function retryOne(it, single) {
+      const vb = single ? ['Downloading', 'Done'] : ['Retrying', 'Retry done'];
       if (!window.showSaveFilePicker) {
         await guarded(async () => { resetItem(it); setRowStatus(it.idx, '...'); try { const link = it.link || await getLink(it.id, auth); triggerDownload(link, it.name); setRowStatus(it.idx, '✓'); it.dlFailed = false; } catch (e) { it.dlFailed = true; setRowStatus(it.idx, 'error'); } });
         return;
@@ -472,23 +540,23 @@
       await guarded(async () => {
         let recv = 0; const total = it.size;
         const onBytes = (nb) => { recv += nb; setRowProgress(it.idx, recv, total); const st = document.querySelector(`[data-st="${it.idx}"]`); if (st && st.textContent !== '✓') st.textContent = total ? Math.min(100, Math.round(recv / total * 100)) + '%' : fmtSize(recv); };
-        statusEl.textContent = `Retrying: ${it.name}`;
+        statusEl.textContent = `${vb[0]}: ${it.name}`;
         try {
           const link = it.link || await getLink(it.id, auth);
           await streamOneFile(link, total, writable, onBytes);
           it.dlFailed = false; setRowStatus(it.idx, '✓');
-          statusEl.textContent = `Retry done: ${it.name}`; faviconCtl.done(); titleCtl.set('✅ Download complete - PikPak'); notify(`Retry done: ${it.name}`); setTimeout(() => titleCtl.restore(), 4000);
+          statusEl.textContent = `${vb[1]}: ${it.name}`; faviconCtl.done(); titleCtl.set('✅ Download complete - PikPak'); notify(`${vb[1]}: ${it.name}`); setTimeout(() => titleCtl.restore(), 4000);
         } catch (e) {
           try { await writable.abort(); } catch (_) {}
           it.dlFailed = true; setRowStatus(it.idx, 'error');
-          statusEl.textContent = 'Retry failed: ' + (e.message === 'CAPTCHA_EXPIRED' ? 'token expired, reload F5' : e.message);
+          statusEl.textContent = (single ? 'Failed: ' : 'Retry failed: ') + (e.message === 'CAPTCHA_EXPIRED' ? 'token expired, reload F5' : e.message);
           faviconCtl.restore(); titleCtl.restore();
         }
       });
     }
 
-    goBtn.onclick = () => { const items = selected().map(i => allItems[i]); runZip(items); };
-    errBtn.onclick = () => runZip(allItems.filter(it => it.linkFailed || it.dlFailed));
+    goBtn.onclick = () => { const items = selected().map(i => allItems[i]); if (items.length === 1) retryOne(items[0], true); else runZip(items); }; // one file: no zip, save it as is
+    errBtn.onclick = () => { const f = allItems.filter(it => it.linkFailed || it.dlFailed); if (f.length === 1) retryOne(f[0], true); else runZip(f); };
   }
 
   // ── SHARE mode (/s/... pages) ────────────────────────────────────────────────
@@ -498,26 +566,169 @@
   // batch-download (chunk + zip) as usual.
   const isSharePage = () => location.pathname.startsWith('/s/');
   const shareHarvest = new Map(); // file id -> { name, size, url, thumb } (dedup per file, keep the newest url)
-  let shareHookInstalled = false;
+  let shareHookInstalled = false, shareSeq = 0;
+  // Links belong to the folder they were harvested in. The preview does not change the URL, a folder
+  // change does: drop every old link when the path changes (client-side navigation = no reload).
+  let harvestPath = location.pathname;
+  function syncHarvestFolder() {
+    if (location.pathname === harvestPath) return;
+    harvestPath = location.pathname;
+    shareHarvest.clear();
+    if (window.__pmdShareUpdate) window.__pmdShareUpdate();
+  }
+
+  // ── auto-capture: while the preview is open, step through every file ──────────
+  // The preview shows a "i / n" counter, a .next-button and a thumbnail strip (.preview-bar). Each
+  // visited position is recorded once its link is harvested; see autoCapture below.
+  let autoRun = false;
+  const previewCounter = () => {
+    const el = document.querySelector('.control-bar__count');
+    const m = el && el.textContent.match(/(\d+)\s*\/\s*(\d+)/);
+    return m ? { i: +m[1], n: +m[2] } : null;
+  };
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const previewName = () => { const t = document.querySelector('.file-manager-container .header .title'); return t ? t.textContent.trim() : ''; };
+  const previewHasLink = () => { const name = previewName(); return !!name && [...shareHarvest.values()].some(h => h.name === name); };
+  // Wait until the file now shown has its link: a new link arrived since `seq`, or the header name is
+  // already harvested. The app prefetches/caches neighbours' file_info, so a step may fire NO
+  // request; cap 3s. Never waits for the video to play.
+  async function waitLink(seq) {
+    for (let t = 0; t < 20 && autoRun; t++) {
+      await sleep(150);
+      if (shareSeq !== seq || previewHasLink()) return;
+    }
+  }
+  // Wait for the "i / n" counter to move (or to reach `want`); null if it never does / the preview closed.
+  async function counterMoved(from, want) {
+    for (let k = 0; k < 20; k++) {
+      const c = previewCounter();
+      if (!c) return null;
+      if (want ? c.i === want : c.i !== from) return c;
+      await sleep(100);
+    }
+    return null;
+  }
+  async function clickMove(sel) {
+    const btn = document.querySelector(sel), from = previewCounter();
+    if (!btn || !from || btn.classList.contains('disabled')) return null;
+    btn.click();
+    return counterMoved(from.i);
+  }
+  // Jump straight to position idx by clicking its thumbnail in .preview-bar. The strip has no file
+  // names, only thumbnails in list order, so position = counter index. Only trusted when the strip
+  // holds all n files (a windowed strip -> null, caller walks with next/prev instead).
+  async function jumpTo(idx, n) {
+    const items = [...document.querySelectorAll('.preview-bar .file-list-item')];
+    const it = items.length === n ? items[idx - 1] : null;
+    if (!it) return null;
+    const t = it.querySelector('.hover-wrap') || it;
+    for (const ty of ['mousedown', 'mouseup', 'click']) t.dispatchEvent(new MouseEvent(ty, { bubbles: true, cancelable: true, view: window }));
+    return counterMoved(0, idx);
+  }
+  // Positions 1..n are the "all" list, `done` (position -> name) the visited list. Walk forward with
+  // next while the following position is undone; otherwise jump to the smallest undone position.
+  // Works from any starting point, never revisits a done position, ends when every position is done.
+  async function autoCapture(btn) {
+    if (autoRun) { autoRun = false; return; } // second click = stop
+    autoRun = true;
+    const done = new Map(), missed = [];
+    let n = 0, allCollected = false;
+    try {
+      const c0 = previewCounter();
+      if (!c0) return;
+      n = c0.n;
+      // Positions whose file already has a link (collected earlier, or prefetched by the app) count as done.
+      // A strip thumbnail URL contains the file's hash; the payload maps hash -> file. Identical files
+      // share a hash (ambiguous) and a windowed strip (length != n) cannot be mapped: both stay undone.
+      const hashOf = (src) => (/thumbnails\/([0-9A-Fa-f]+)\//.exec(src) || [])[1];
+      const markKnown = () => {
+        const exp = nuxtShareFiles(), strip = [...document.querySelectorAll('.preview-bar .file-list-item')];
+        if (!exp.length || strip.length !== n) return;
+        const byHash = new Map();
+        for (const f of exp) if (f.hash) byHash.set(f.hash, (byHash.get(f.hash) || []).concat(f));
+        strip.forEach((el, k) => {
+          const fs = byHash.get(hashOf((el.querySelector('img') || {}).src || ''));
+          if (fs && fs.length === 1 && shareHarvest.has(fs[0].id) && !done.has(k + 1)) done.set(k + 1, fs[0].name);
+        });
+      };
+      const visit = async (seq) => { // current position is on screen: wait for its link, record it
+        await waitLink(seq);
+        const c = previewCounter(); if (!c) return;
+        done.set(c.i, previewName());
+        if (!previewHasLink()) missed.push(c.i);
+      };
+      markKnown();
+      { const c = previewCounter(); if (c && !done.has(c.i)) await visit(shareSeq); }
+      for (let guard = 0; autoRun && guard < n * 3 + 10; guard++) {
+        const c = previewCounter(); if (!c) break;
+        markKnown();
+        // payload knows every file of the folder: once all have links and it covers the whole preview, stop.
+        const exp = nuxtShareFiles();
+        if (exp.length >= n && exp.every(f => shareHarvest.has(f.id))) { allCollected = true; break; } // the app prefetches neighbours' file_info, so this can happen before the last position
+        let t = (c.i < n && !done.has(c.i + 1)) ? c.i + 1 : 0;
+        if (!t) for (let k = 1; k <= n; k++) if (!done.has(k)) { t = k; break; }
+        if (!t) break; // all positions done
+        btn.textContent = `⏹ Stop (${done.size}/${n})`;
+        const seq = shareSeq;
+        let nc = t === c.i + 1 ? await clickMove('.next-button') : await jumpTo(t, n);
+        if (!nc && t !== c.i + 1) nc = await clickMove(t > c.i ? '.next-button' : '.pre-button'); // strip has no such thumb: walk
+        if (!nc) break;
+        await visit(seq);
+      }
+    } finally {
+      await sleep(1500); // let in-flight file_info responses land
+      autoRun = false;
+      const idle = '⏭ Auto-capture all';
+      btn.textContent = missed.length ? `${idle} (${missed.length} missed)` : allCollected ? `✓ All ${n} links collected` : idle;
+      if (allCollected) setTimeout(() => { if (!autoRun) btn.textContent = idle; }, 5000); // feedback, then back to the normal label
+      if (missed.length) console.warn('[PMD] auto-capture: no link for preview positions', missed);
+      if (window.__pmdShareUpdate) window.__pmdShareUpdate();
+    }
+  }
+  // Show the button only while a preview is open (has the "i / n" counter).
+  function mountAutoButton() {
+    let b = document.getElementById('pmd-auto');
+    const show = isSharePage() && !!previewCounter();
+    if (!show) { if (b && !autoRun) b.remove(); return; }
+    if (b) return;
+    b = document.createElement('button');
+    b.id = 'pmd-auto'; b.textContent = '⏭ Auto-capture all';
+    b.title = 'Step through the rest of the files in this preview and collect their links';
+    b.onclick = () => autoCapture(b);
+    document.body.appendChild(b);
+  }
   function installShareHook() {
     if (shareHookInstalled) return; shareHookInstalled = true;
     const of = window.fetch;
     window.fetch = function (input, init) {
       const url = (typeof input === 'string') ? input : (input && input.url);
       const r = of.apply(this, arguments);
+      if (url && /share\/detail|share:batch_file_info/.test(url)) { // folder listings (also on client-side navigation) -> folder tree + name->id
+        r.then(async (res) => { try { const j = await res.clone().json(); learnEntries(j.files); setTimeout(paintMarks, 600); } catch (e) { /* ignore */ } });
+      }
       if (url && /share\/file_info/.test(url)) {
         r.then(async (res) => {
           try {
             const j = await res.clone().json(); const fi = j.file_info || {};
-            const o = (fi.medias || []).find(m => m.is_origin && m.link && m.link.url);
+            // Videos: origin link in medias[]. Images (and other plain files): medias is empty,
+            // the link is file_info.web_content_link (verified on a .jpg share, 2026-11-14).
+            const m0 = (fi.medias || []).find(m => m.is_origin && m.link && m.link.url);
+            const o = m0 ? { link: { url: m0.link.url } } : (fi.web_content_link ? { link: { url: fi.web_content_link } } : null);
             if (o && fi.name && fi.id) {
               // Real thumbnail: file_info.thumbnail_link is empty -> take it from the grid card
               // (each card has <img alt="<file name>" src="<real thumbnail>">). Fall back to the generic icon.
               let thumb = fi.thumbnail_link || '';
               if (!thumb) { const im = [...document.querySelectorAll('img[alt]')].find(x => x.getAttribute('alt') === fi.name); if (im) thumb = im.src; }
               if (!thumb) thumb = fi.icon_link || '';
+              syncHarvestFolder();
+              shareSeq++; // every file_info with a link (even a repeat) = "current file captured" signal for auto-capture
               const before = shareHarvest.size;
-              shareHarvest.set(fi.id, { name: fi.name, size: +fi.size || 0, url: o.link.url, thumb });
+              // Lower-quality transcodes of the same file: the fallback when the original's storage is damaged.
+              // Prefer h264 (plays everywhere) over hevc, then the larger picture. Label = short side (+ codec if not h264).
+              const vid = (m) => m.video || {}, side = (m) => Math.min(vid(m).width || 0, vid(m).height || 0), h264 = (m) => /264|avc/i.test(vid(m).video_codec || '') ? 1 : 0;
+              const alts = (fi.medias || []).filter(m => !m.is_origin && m.link && m.link.url).sort((a, b) => (h264(b) - h264(a)) || (side(b) - side(a)));
+              const alt = alts[0] ? { url: alts[0].link.url, label: (side(alts[0]) ? side(alts[0]) + 'p' : 'alt') + (h264(alts[0]) || !vid(alts[0]).video_codec ? '' : ' ' + vid(alts[0]).video_codec) } : null;
+              shareHarvest.set(fi.id, { name: fi.name, size: +fi.size || 0, url: o.link.url, thumb, alt, parent: fi.parent_id || '' });
               if (shareHarvest.size !== before && window.__pmdShareUpdate) window.__pmdShareUpdate();
             }
           } catch (e) { /* ignore */ }
@@ -527,6 +738,114 @@
     };
   }
 
+  // ── #__NUXT_DATA__: the folder's first page, server-rendered (ids, names, sizes, REAL thumbnails) ──
+  // devalue format: a flat array where object values / array items are indexes into it. It has NO
+  // download links (those only come from share/file_info on preview), but it gives the full file list
+  // up front so the panel can show every file and auto-capture can tell which links are still missing.
+  // It is not updated on client-side navigation, so it is trusted only while it matches the page's cards.
+  let nuxtCache = { len: -1, data: {} };
+  function nuxtData() {
+    try {
+      const el = document.querySelector('#__NUXT_DATA__'); if (!el) return {};
+      const text = el.textContent;
+      if (text.length === nuxtCache.len) return nuxtCache.data; // unchanged since the last parse
+      const raw = JSON.parse(text), memo = new Map();
+      const rv = (i) => {
+        if (i < 0) return undefined; if (memo.has(i)) return memo.get(i);
+        const v = raw[i]; if (v === null || typeof v !== 'object') return v;
+        if (Array.isArray(v)) {
+          if (typeof v[0] === 'string' && /^(Shallow)?(Reactive|Ref)$/.test(v[0])) { const r = rv(v[1]); memo.set(i, r); return r; }
+          if (typeof v[0] === 'string' && /^(Set|Map|Date|undefined|NaN|null|Infinity|-Infinity|-0|BigInt|RegExp|Error|Object|Symbol)$/.test(v[0])) return undefined;
+          const a = []; memo.set(i, a); v.forEach(x => a.push(rv(x))); return a;
+        }
+        const o = {}; memo.set(i, o); for (const k in v) o[k] = rv(v[k]); return o;
+      };
+      const data = (rv(0) || {}).data || {};
+      nuxtCache = { len: text.length, data };
+      return data;
+    } catch (e) { return {}; }
+  }
+  // Every file/folder entry the server rendered (any kind), for learning the folder tree.
+  function nuxtEntries() {
+    const out = [], data = nuxtData();
+    for (const k in data) for (const f of ((data[k] || {}).files || [])) if (f && f.id && f.name) out.push(f);
+    return out;
+  }
+  function nuxtShareFiles() {
+    try {
+      const data = nuxtData();
+      let best = [];
+      for (const k in data) {
+        const fs = ((data[k] || {}).files || []).filter(f => f && f.kind === 'drive#file' && f.id && f.name);
+        if (fs.length > best.length) best = fs;
+      }
+      const cards = new Set([...document.querySelectorAll('.file-item a.name')].map(a => a.textContent.trim()));
+      if (!best.some(f => cards.has(f.name))) return []; // stale (other folder) or not rendered yet
+      return best.map(f => ({ id: f.id, name: f.name, size: +f.size || 0, hash: f.hash || '', parent: f.parent_id || '', thumb: f.thumbnail_link || f.icon_link || '' }));
+    } catch (e) { return []; }
+  }
+
+  // ── download marks: green ✓ on media already downloaded and on folders that contain one, red ✕ on
+  // media whose download failed (and on folders that contain one) ─────────────────────────────────
+  // Cards in the page carry no ids, so a card is matched to its file/folder by NAME inside the listing it
+  // belongs to (the listing with the most name matches among the ones seen: the page's server-rendered
+  // data and the share/detail responses). Folder ancestry is learned from those same listings
+  // (folder id -> parent id) and kept in localStorage together with the marks, so ticks survive reloads.
+  const MARKS_KEY = 'pmd_marks_v1', TREE_KEY = 'pmd_tree_v1';
+  const loadJson = (k) => { try { return JSON.parse(localStorage.getItem(k)) || {}; } catch (e) { return {}; } };
+  const marks = loadJson(MARKS_KEY); // file id -> { p: parent folder id, s: 'ok' | 'err' }
+  const tree = loadJson(TREE_KEY);   // folder id -> parent folder id
+  const listings = new Map();        // parent folder id -> Map(name -> { id, kind })
+  let marksTimer = 0;
+  const saveMarks = () => { clearTimeout(marksTimer); marksTimer = setTimeout(() => { try { localStorage.setItem(MARKS_KEY, JSON.stringify(marks)); localStorage.setItem(TREE_KEY, JSON.stringify(tree)); } catch (e) {} }, 400); };
+  function learnEntries(files) {
+    let changed = false;
+    for (const f of files || []) {
+      if (!f || !f.id || !f.name) continue;
+      const parent = f.parent_id || '';
+      if (f.kind === 'drive#folder' && tree[f.id] !== parent) { tree[f.id] = parent; changed = true; }
+      let m = listings.get(parent); if (!m) listings.set(parent, m = new Map());
+      if (!m.has(f.name)) m.set(f.name, { id: f.id, kind: f.kind });
+    }
+    if (changed) saveMarks();
+  }
+  function recordMark(it, ok) {
+    if (!it || !it.id || !isSharePage()) return;
+    marks[it.id] = { p: it.parent || '', s: ok ? 'ok' : 'err' };
+    saveMarks(); paintMarks();
+  }
+  function paintMarks() {
+    if (!isSharePage()) return;
+    learnEntries(nuxtEntries());
+    const cards = [...document.querySelectorAll('.file-item')];
+    if (!cards.length) return;
+    const names = cards.map(c => (c.querySelector('a.name')?.textContent || '').trim());
+    let best = null, bestN = 0;
+    for (const m of listings.values()) { let n = 0; for (const nm of names) if (m.has(nm)) n++; if (n > bestN) { bestN = n; best = m; } }
+    const okAnc = new Set(), errAnc = new Set(); // folders that contain a downloaded / a failed file (any depth)
+    for (const id in marks) { const mk = marks[id], set = mk.s === 'ok' ? okAnc : errAnc; let p = mk.p, g = 0; while (p && !set.has(p) && g++ < 64) { set.add(p); p = tree[p]; } }
+    cards.forEach((c, i) => {
+      const e = best && best.get(names[i]);
+      let ok = false, err = false, folder = false;
+      if (e) {
+        folder = e.kind === 'drive#folder';
+        if (folder) { ok = okAnc.has(e.id); err = errAnc.has(e.id); } else { const mk = marks[e.id]; ok = !!mk && mk.s === 'ok'; err = !!mk && mk.s === 'err'; }
+      }
+      const host = c.querySelector('.thumbnail-wrap') || c, sig = (ok ? 'o' : '') + (err ? 'e' : '') + (folder ? 'f' : '');
+      if ((host.dataset.pmdMark || '') === sig) return;
+      host.dataset.pmdMark = sig;
+      const old = host.querySelector(':scope > .pmd-marks'); if (old) old.remove();
+      if (!ok && !err) return;
+      if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+      const box = document.createElement('span'); box.className = 'pmd-marks';
+      if (err) { const b = document.createElement('span'); b.className = 'pmd-mark pmd-mark-err'; b.textContent = '✕'; b.title = folder ? 'Contains files that failed to download' : 'Download failed'; box.appendChild(b); }
+      if (ok) { const b = document.createElement('span'); b.className = 'pmd-mark pmd-mark-ok'; b.textContent = '✓'; b.title = folder ? 'Contains downloaded files' : 'Downloaded'; box.appendChild(b); }
+      host.appendChild(box);
+    });
+  }
+
+  const pageNames = () => [...document.querySelectorAll('.file-item a.name')].map(a => a.textContent.trim());
+  let orderSig = ''; // page order the panel was last rendered with
   let sharePanelOpen = false;
   async function openSharePanel() {
     if (sharePanelOpen) return; sharePanelOpen = true;
@@ -536,7 +855,7 @@
     overlay.innerHTML = `
       <div id="pmd-panel">
         <div id="pmd-head"><b>Download share (no import)</b><span class="pmd-sub" id="pmd-sub"></span><button id="pmd-close">×</button></div>
-        <div id="pmd-hint" style="padding:8px 18px;font-size:12px;color:#888;border-bottom:1px solid #f0f0f0"><b>Preview</b> each file you want - its link is collected here automatically (use the thumbnail strip in the preview to flip through quickly). Then tick and click <b>Download ZIP</b>.</div>
+        <div id="pmd-hint" style="padding:8px 18px;font-size:12px;color:#888;border-bottom:1px solid #f0f0f0">Every file of this folder is listed. A link is collected when the file is previewed: click <b>▶</b> on a row, or open any preview and press <b>⏭ Auto-capture all</b>. Faded rows have no link yet. Then tick and click <b>Download ZIP</b> (one file: it is saved as is, no zip).</div>
         <div id="pmd-tools"><label><input type="checkbox" id="pmd-all"> Select all</label><span id="pmd-count"></span><button id="pmd-view"></button></div>
         <div id="pmd-list"></div>
         <div id="pmd-foot"><span id="pmd-status"></span><div style="margin-left:auto;display:flex;gap:8px;align-items:center"><button id="pmd-err" style="display:none">↻ Retry failed</button><button id="pmd-go" disabled>Download ZIP</button></div></div>
@@ -552,7 +871,7 @@
     const goBtn = overlay.querySelector('#pmd-go'), errBtn = overlay.querySelector('#pmd-err'), statusEl = overlay.querySelector('#pmd-status');
     const countEl = overlay.querySelector('#pmd-count'), allBox = overlay.querySelector('#pmd-all');
 
-    let items = []; // { idx, id, name, size, link, thumb, dlFailed }
+    let items = []; // { idx, id, name, size, link ('' = not collected yet), thumb, dlFailed }
     const setRowStatus = (i, txt) => {
       const st = listEl.querySelector(`[data-st="${i}"]`);
       if (st) { st.textContent = txt; const isErr = txt === 'error'; st.style.color = txt === '✓' ? '#2ca02c' : (isErr ? '#d62728' : '#888'); }
@@ -562,27 +881,56 @@
     const setRowProgress = (i, recv, total) => { const pr = listEl.querySelector(`[data-prog="${i}"]`); if (pr && total) pr.style.width = Math.min(100, recv / total * 100) + '%'; };
     const boxes = () => [...listEl.querySelectorAll('input[type=checkbox]')];
     const selectedItems = () => boxes().filter(b => b.checked).map(b => items[+b.dataset.i]).filter(Boolean);
-    const refreshGo = () => { if (busy) return; const n = selectedItems().length; countEl.textContent = n ? n + ' selected' : ''; goBtn.disabled = !n; goBtn.textContent = n ? `Download ZIP (${n})` : 'Download ZIP'; allBox.checked = items.length > 0 && n === items.length; };
+    const refreshGo = () => { if (busy) return; const n = selectedItems().length; countEl.textContent = n ? n + ' selected' : ''; goBtn.disabled = !n; goBtn.textContent = n === 1 ? 'Download file' : n ? `Download ZIP (${n})` : 'Download ZIP'; const linked = items.filter(it => it.link).length; allBox.checked = linked > 0 && n === linked; };
     const updateErr = () => { const n = items.filter(it => it.dlFailed).length; errBtn.style.display = n ? '' : 'none'; errBtn.textContent = `↻ Retry failed (${n})`; };
     // Re-render the list when new links are harvested. NEW files are checked by default; keep existing checkbox state.
     const render = () => {
       if (busy) return; // downloading: don't rebuild (would wipe per-row ✓/error state)
-      const prevIds = new Set(items.map(it => it.id));
+      const prevLinked = new Set(items.filter(it => it.link).map(it => it.id));
       const checkedIds = new Set(boxes().filter(b => b.checked).map(b => b.dataset.id));
-      items = [...shareHarvest.entries()].map(([id, h], i) => ({ idx: i, id, name: h.name, size: h.size, link: h.url, thumb: h.thumb }));
-      subEl.textContent = items.length + ' link(s) collected · ' + fmtSize(items.reduce((s, it) => s + it.size, 0));
+      // All files of the folder (payload order), linked or not; then any harvested file outside the payload (later pages).
+      const expected = nuxtShareFiles(), seen = new Set();
+      items = expected.map((f, i) => { seen.add(f.id); const h = shareHarvest.get(f.id); return { idx: i, id: f.id, name: f.name, size: f.size, link: h ? h.url : '', alt: h ? h.alt : null, parent: f.parent || (h && h.parent) || '', thumb: f.thumb || (h && h.thumb) || '' }; });
+      for (const [id, h] of shareHarvest) if (!seen.has(id)) items.push({ idx: items.length, id, name: h.name, size: h.size, link: h.url, alt: h.alt, parent: h.parent, thumb: h.thumb });
+      // Same order as the page's own list (it changes with the user's sort); files not rendered there keep payload order after.
+      const pos = new Map(); pageNames().forEach((n, i) => { if (!pos.has(n)) pos.set(n, i); });
+      items.sort((a, b) => (pos.has(a.name) ? pos.get(a.name) : Infinity) - (pos.has(b.name) ? pos.get(b.name) : Infinity) || a.idx - b.idx);
+      items.forEach((it, i) => { it.idx = i; });
+      orderSig = pageNames().join('|');
+      const linked = items.filter(it => it.link);
+      subEl.textContent = (expected.length ? linked.length + '/' + items.length + ' links collected' : linked.length + ' link(s) collected') + ' · ' + fmtSize(linked.reduce((s, it) => s + it.size, 0));
       listEl.innerHTML = items.map(it => {
-        const chk = (!prevIds.has(it.id) || checkedIds.has(it.id)) ? ' checked' : '';
-        return `<div class="pmd-row"><input type="checkbox" data-i="${it.idx}" data-id="${it.id}"${chk}>` +
+        const has = !!it.link;
+        const chk = has && (!prevLinked.has(it.id) || checkedIds.has(it.id)) ? ' checked' : '';
+        return `<div class="pmd-row${has ? '' : ' pmd-nolink'}"><input type="checkbox" data-i="${it.idx}" data-id="${it.id}"${chk}${has ? '' : ' disabled'}>` +
           `<img class="pmd-thumb" src="${it.thumb}">` +
           `<span class="pmd-name" title="${it.name.replace(/"/g, '&quot;')}">${it.name}</span>` +
-          `<span class="pmd-sz">${fmtSize(it.size)}</span><span class="pmd-st" data-st="${it.idx}"></span>` +
+          `<button class="pmd-play" data-play="${it.id}" title="Preview this file">▶</button>` +
+          `<span class="pmd-sz">${fmtSize(it.size)}</span><span class="pmd-st" data-st="${it.idx}">${has ? '' : 'no link'}</span>` +
           `<div class="pmd-prog" data-prog="${it.idx}"></div></div>`;
       }).join('');
       refreshGo();
     };
     listEl.addEventListener('change', refreshGo);
-    allBox.onchange = () => { boxes().forEach(b => b.checked = allBox.checked); refreshGo(); };
+    // Open the page's own preview for a file: click its grid card, hide this panel until the preview closes.
+    async function openPreview(id) {
+      const it = items.find(x => x.id === id); if (!it) return;
+      const card = [...document.querySelectorAll('.file-item')].find(c => (c.querySelector('a.name')?.textContent || '').trim() === it.name);
+      if (!card) { statusEl.textContent = 'This file is not in the page list yet - scroll to it, then try again.'; return; }
+      overlay.style.display = 'none';
+      const tgt = card.querySelector('.thumbnail-wrap') || card;
+      for (const t of ['mousedown', 'mouseup', 'click', 'mousedown', 'mouseup', 'click', 'dblclick']) tgt.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, detail: t === 'dblclick' ? 2 : 1, view: window }));
+      for (let t = 0; t < 20 && !previewCounter(); t++) await sleep(250); // wait for the preview to open
+      while (previewCounter() && overlay.isConnected) await sleep(400);    // ...then for the user to close it
+      overlay.style.display = '';
+    }
+    listEl.addEventListener('click', (e) => {
+      if (busy) return;
+      const pb = e.target.closest('.pmd-play'); if (pb) { openPreview(pb.dataset.play); return; }
+      if (e.target.closest('input,button')) return;
+      const cb = e.target.closest('.pmd-row')?.querySelector('input[type=checkbox]'); if (cb) { cb.checked = !cb.checked; refreshGo(); } // click anywhere on the row toggles it
+    });
+    allBox.onchange = () => { boxes().forEach(b => { if (!b.disabled) b.checked = allBox.checked; }); refreshGo(); };
     window.__pmdShareUpdate = render;
     render();
 
@@ -605,23 +953,64 @@
           const totalBytes = dlItems.reduce((s, it) => s + (it.size || 0), 0);
           const onProg = (df, tf, by) => { const pct = totalBytes ? Math.min(100, Math.round(by / totalBytes * 100)) : 0; statusEl.textContent = `Downloading ${df}/${dlItems.length} · ${fmtSize(by)} / ${fmtSize(totalBytes)} · ${pct}%`; titleCtl.set(`⬇ ${pct}% - PikPak`); };
           onProg(0, dlItems.length, 0);
-          const { doneFiles } = await streamZip(dlItems, writable, onProg, setRowStatus, setRowProgress);
+          const { doneFiles, fallback } = await streamZip(dlItems, writable, onProg, setRowStatus, setRowProgress);
           const totFail = dlItems.filter(it => it.dlFailed).length;
           // PikPak throttles anonymous share downloads after ~1.8GB per link (measured). Larger files break mid-way.
           const bigFail = dlItems.some(it => it.dlFailed && it.size > 1.6 * 1073741824);
           statusEl.textContent = `Done: ${doneFiles} file(s) in ZIP` + (totFail ? `, ${totFail} failed` : '') + '. ZIP saved.' +
+            (fallback.length ? ` ${fallback.length} file(s) were unreadable on PikPak's storage; a lower-quality copy was saved instead (the name has the quality; a .ts file is MPEG-TS - open it with VLC or mpv).` : '') +
             (bigFail ? ' Note: PikPak caps anonymous share downloads at ~1.8GB/file - larger files need "Save to PikPak" then download from your Drive.' : '');
           faviconCtl.done(); titleCtl.set('✅ Download complete - PikPak'); notify(`Done: ${doneFiles} file(s)`); setTimeout(() => titleCtl.restore(), 6000);
         } catch (e) { try { await writable.abort(); } catch (_) {} statusEl.textContent = 'Error: ' + e.message; faviconCtl.restore(); titleCtl.restore(); }
       });
     }
-    goBtn.onclick = () => { render(); runZipShare(selectedItems()); }; // render() -> newest urls; only download ticked files
-    errBtn.onclick = () => runZipShare(items.filter(it => it.dlFailed));
+    // One file: no zip, save it as is (same probe + lower-quality fallback as the zip path). Probing happens
+    // before the save dialog so a fallback copy gets its real name/extension; it takes a second or two, well
+    // inside the browser's window for a dialog opened from a click.
+    async function runSingleShare(it) {
+      let tgt = { name: it.name, link: it.link, size: it.size, alt: '', ts: false };
+      statusEl.textContent = `Checking: ${it.name}`;
+      try {
+        if (it.size >= SMALL_FILE && !(await probeFile(it.link, it.size))) {
+          if (!it.alt || !it.alt.url) { it.dlFailed = true; setRowStatus(it.idx, 'error'); recordMark(it, false); statusEl.textContent = "Failed: this file is unreadable on PikPak's storage (part of it cannot be downloaded)."; return; }
+          tgt = await altTarget(it.name, it.alt);
+        }
+      } catch (e) { statusEl.textContent = 'Failed: ' + e.message; return; }
+      let handle;
+      try { handle = await window.showSaveFilePicker({ suggestedName: tgt.name }); }
+      catch (e) { if (e && e.name !== 'AbortError') statusEl.textContent = 'The save dialog was blocked (took too long) - click Download again.'; else statusEl.textContent = ''; return; }
+      const writable = await handle.createWritable();
+      await guarded(async () => {
+        let recv = 0;
+        const onBytes = (nb) => {
+          recv += nb; setRowProgress(it.idx, recv, tgt.size);
+          const pct = tgt.size ? Math.min(100, Math.round(recv / tgt.size * 100)) : 0;
+          const st = listEl.querySelector(`[data-st="${it.idx}"]`); if (st) st.textContent = tgt.size ? pct + '%' : fmtSize(recv);
+          statusEl.textContent = `Downloading: ${tgt.name} · ${fmtSize(recv)}${tgt.size ? ' / ' + fmtSize(tgt.size) + ' · ' + pct + '%' : ''}`;
+          if (tgt.size) titleCtl.set(`⬇ ${pct}% - PikPak`);
+        };
+        try {
+          setRowStatus(it.idx, '0%');
+          await streamOneFile(tgt.link, tgt.size, writable, onBytes);
+          it.dlFailed = false; setRowStatus(it.idx, '✓'); recordMark(it, true);
+          const st = listEl.querySelector(`[data-st="${it.idx}"]`); if (tgt.alt && st) st.textContent = '✓ ' + tgt.alt;
+          statusEl.textContent = `Done: ${tgt.name}` + (tgt.alt ? ` - the original is unreadable on PikPak's storage, saved a lower-quality copy instead${tgt.ts ? ' (MPEG-TS: open it with VLC or mpv)' : ''}.` : '');
+          faviconCtl.done(); titleCtl.set('✅ Download complete - PikPak'); notify(`Done: ${tgt.name}`); setTimeout(() => titleCtl.restore(), 6000);
+        } catch (e) {
+          try { await writable.abort(); } catch (_) {}
+          it.dlFailed = true; setRowStatus(it.idx, 'error'); recordMark(it, false);
+          statusEl.textContent = 'Failed: ' + e.message; faviconCtl.restore(); titleCtl.restore();
+        }
+      });
+    }
+    const runShare = (list) => (list.length === 1 && window.showSaveFilePicker) ? runSingleShare(list[0]) : runZipShare(list);
+    goBtn.onclick = () => { render(); runShare(selectedItems()); }; // render() -> newest urls; only download ticked files
+    errBtn.onclick = () => runShare(items.filter(it => it.dlFailed));
   }
 
   // ── mount ──────────────────────────────────────────────────────────────────
   function mountButton() {
-    if (isSharePage()) installShareHook(); // start harvesting even before the panel opens
+    if (isSharePage()) { syncHarvestFolder(); installShareHook(); mountAutoButton(); paintMarks(); if (window.__pmdShareUpdate && pageNames().join('|') !== orderSig) window.__pmdShareUpdate(); } // sort changed outside -> re-sync the panel // start harvesting even before the panel opens
     if (document.getElementById('pmd-btn')) return;
     const b = document.createElement('button');
     b.id = 'pmd-btn';

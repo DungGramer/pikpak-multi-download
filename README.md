@@ -13,6 +13,10 @@ A userscript that adds **batch downloading** to the [PikPak](https://mypikpak.co
 - **No more per-file popups** - the ZIP is streamed straight to disk via the File System Access API (low RAM, handles many GB), so the browser asks for a save location **once**.
 - **Fast (IDM-style)** - each file is fetched with several parallel byte-range connections (~3.5x faster than a single connection in testing).
 - **Share links, no import** - on a `/s/...` share page, links are collected as you preview files, then batch-downloaded. No need to "Save to my PikPak" first.
+- **Auto-capture** - while a share preview is open, one button steps through every file and collects all links (skips files whose link is already known).
+- **Download marks** - on share pages, a green ✓ on media already downloaded and on folders containing one, a red ✕ on media that failed.
+- **Damaged files** - a share file whose storage is unreadable is detected before zipping; a lower-quality copy is saved instead when PikPak offers one (may be `.ts`).
+- **Single file = no zip** - downloading one file saves it as is.
 - **Thumbnails + List/Grid view** - real file thumbnails, switchable layout.
 - **Per-file progress bars**, overall progress in the tab **title** and a **spinning favicon**, plus a completion **notification**.
 - **Safety** - blocks accidental modal close / page reload while a download is running.
@@ -35,7 +39,7 @@ A userscript that adds **batch downloading** to the [PikPak](https://mypikpak.co
 
 ### Share links (no import needed)
 1. Open a share page `https://mypikpak.com/s/...`.
-2. **Preview** each file you want - its download link is collected automatically (use the thumbnail strip inside the preview to flip through quickly).
+2. Open a preview and press **⏭ Auto-capture all** (or **Preview** files yourself, or click **▶** on a row in the panel) - download links are collected automatically.
    > A userscript cannot open the preview for you: the site requires a real click to sign each file's request, so previewing is the manual step.
 3. Click **⬇ Download share**, tick the collected files, then **Download ZIP**.
 
